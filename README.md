@@ -13,3 +13,4 @@
 WARNING:absl:You are saving your model as an HDF5 file via `model.save()` or `keras.saving.save_model(model)`. This file format is considered legacy. We recommend using instead the native Keras format, e.g. `model.save('my_model.keras')` or `keras.saving.save_model(model, 'my_model.keras')`.
 Модель сохранена как 'cifar10_best_model.h5'.
 Графики сохранены как 'training_curves.png'.
+
