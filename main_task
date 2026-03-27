@@ -1,0 +1,161 @@
+"""
+Основное задание: обучение свёрточной нейросети на CIFAR-10.
+Достижение точности на тесте ≥92% с контролем переобучения.
+"""
+
+import os
+# Отключаем GPU, если он есть – работаем на CPU
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers, models, datasets, callbacks
+import numpy as np
+import time
+import matplotlib.pyplot as plt
+
+# Фиксируем seed для воспроизводимости
+tf.random.set_seed(42)
+np.random.seed(42)
+
+print("TensorFlow использует устройства:", tf.config.list_physical_devices())
+print("Работаем на CPU.\n")
+
+# -------------------------------------------------------------------
+# 1. Загрузка и подготовка данных CIFAR-10
+# -------------------------------------------------------------------
+print("Загрузка данных CIFAR-10...")
+(x_train_full, y_train_full), (x_test, y_test) = datasets.cifar10.load_data()
+
+# Нормализация пикселей к диапазону [0,1]
+x_train_full = x_train_full.astype('float32') / 255.0
+x_test = x_test.astype('float32') / 255.0
+
+# Преобразование меток в one-hot кодирование
+y_train_full = keras.utils.to_categorical(y_train_full, 10)
+y_test = keras.utils.to_categorical(y_test, 10)
+
+# Разделение на train и validation (90% / 10%)
+from sklearn.model_selection import train_test_split
+x_train, x_val, y_train, y_val = train_test_split(
+    x_train_full, y_train_full, test_size=0.1, random_state=42
+)
+
+print(f"Размеры: train {x_train.shape}, val {x_val.shape}, test {x_test.shape}")
+
+# -------------------------------------------------------------------
+# 2. Построение модели (без Dropout)
+# -------------------------------------------------------------------
+def create_model():
+    model = models.Sequential([
+        # Блок 1: 32 фильтра
+        layers.Conv2D(32, (3,3), padding='same', activation='relu', input_shape=(32,32,3)),
+        layers.BatchNormalization(),
+        layers.Conv2D(32, (3,3), padding='same', activation='relu'),
+        layers.BatchNormalization(),
+        layers.MaxPooling2D((2,2)),
+        
+        # Блок 2: 64 фильтра
+        layers.Conv2D(64, (3,3), padding='same', activation='relu'),
+        layers.BatchNormalization(),
+        layers.Conv2D(64, (3,3), padding='same', activation='relu'),
+        layers.BatchNormalization(),
+        layers.MaxPooling2D((2,2)),
+        
+        # Блок 3: 128 фильтров
+        layers.Conv2D(128, (3,3), padding='same', activation='relu'),
+        layers.BatchNormalization(),
+        layers.Conv2D(128, (3,3), padding='same', activation='relu'),
+        layers.BatchNormalization(),
+        layers.MaxPooling2D((2,2)),
+        
+        # Глобальный усредняющий пулинг и выходной слой
+        layers.GlobalAveragePooling2D(),
+        layers.Dense(10, activation='softmax')
+    ])
+    return model
+
+model = create_model()
+model.summary()
+
+# Компиляция
+model.compile(optimizer='adam',
+              loss='categorical_crossentropy',
+              metrics=['accuracy'])
+
+# -------------------------------------------------------------------
+# 3. Настройка колбэков для контроля переобучения
+# -------------------------------------------------------------------
+early_stop = callbacks.EarlyStopping(
+    monitor='val_accuracy',
+    patience=10,
+    restore_best_weights=True,
+    verbose=1
+)
+
+reduce_lr = callbacks.ReduceLROnPlateau(
+    monitor='val_accuracy',
+    factor=0.5,
+    patience=5,
+    verbose=1,
+    min_lr=1e-6
+)
+
+# -------------------------------------------------------------------
+# 4. Обучение
+# -------------------------------------------------------------------
+print("\nНачинаем обучение (на CPU, может занять 15–40 минут)...")
+start_time = time.time()
+
+history = model.fit(
+    x_train, y_train,
+    batch_size=128,
+    epochs=50,
+    validation_data=(x_val, y_val),
+    callbacks=[early_stop, reduce_lr],
+    verbose=1
+)
+
+training_time = time.time() - start_time
+print(f"\nОбучение завершено за {training_time/60:.1f} минут.")
+
+# -------------------------------------------------------------------
+# 5. Оценка на тестовой выборке
+# -------------------------------------------------------------------
+test_loss, test_acc = model.evaluate(x_test, y_test, verbose=0)
+print(f"\nТочность на тестовой выборке (без Dropout): {test_acc:.4f}")
+
+if test_acc >= 0.92:
+    print("Условие выполнено: точность >= 92%")
+else:
+    print("Условие не выполнено. Рекомендуется увеличить количество эпох или добавить аугментацию.")
+
+# -------------------------------------------------------------------
+# 6. Сохранение модели и графиков
+# -------------------------------------------------------------------
+model.save('cifar10_best_model.h5')
+print("Модель сохранена как 'cifar10_best_model.h5'.")
+
+# Построение графиков обучения
+plt.figure(figsize=(12,4))
+
+plt.subplot(1,2,1)
+plt.plot(history.history['accuracy'], label='Train Acc')
+plt.plot(history.history['val_accuracy'], label='Val Acc')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.legend()
+plt.title('Accuracy curves')
+
+plt.subplot(1,2,2)
+plt.plot(history.history['loss'], label='Train Loss')
+plt.plot(history.history['val_loss'], label='Val Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+plt.title('Loss curves')
+
+plt.tight_layout()
+plt.savefig('training_curves.png')
+print("Графики сохранены как 'training_curves.png'.")
+plt.show()
