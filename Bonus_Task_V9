@@ -1,136 +1,251 @@
-import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
-
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers, models, datasets, callbacks
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader, random_split
 import numpy as np
 import time
+import matplotlib.pyplot as plt
+import multiprocessing
 
-# Фиксируем seed
-tf.random.set_seed(42)
+torch.manual_seed(42)
 np.random.seed(42)
 
-print("TensorFlow использует устройства:", tf.config.list_physical_devices())
-print("Работаем на CPU.\n")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Устройство: {device}")
 
 # -------------------------------------------------------------------
-# 1. Загрузка данных (те же самые)
+# Аугментация (как в основном задании)
 # -------------------------------------------------------------------
-print("Загрузка данных CIFAR-10...")
-(x_train_full, y_train_full), (x_test, y_test) = datasets.cifar10.load_data()
+class Cutout:
+    def __init__(self, size=16):
+        self.size = size
+    def __call__(self, img):
+        h, w = img.size(1), img.size(2)
+        x = np.random.randint(0, w)
+        y = np.random.randint(0, h)
+        x1 = max(0, x - self.size // 2)
+        y1 = max(0, y - self.size // 2)
+        x2 = min(w, x + self.size // 2)
+        y2 = min(h, y + self.size // 2)
+        img[:, y1:y2, x1:x2] = 0
+        return img
 
-x_train_full = x_train_full.astype('float32') / 255.0
-x_test = x_test.astype('float32') / 255.0
+transform_train = transforms.Compose([
+    transforms.RandomCrop(32, padding=4),
+    transforms.RandomHorizontalFlip(),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+    transforms.ToTensor(),
+    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    Cutout(size=16),
+])
 
-y_train_full = keras.utils.to_categorical(y_train_full, 10)
-y_test = keras.utils.to_categorical(y_test, 10)
-
-from sklearn.model_selection import train_test_split
-x_train, x_val, y_train, y_val = train_test_split(
-    x_train_full, y_train_full, test_size=0.1, random_state=42
-)
-
-print(f"Размеры: train {x_train.shape}, val {x_val.shape}, test {x_test.shape}")
-
-# -------------------------------------------------------------------
-# 2. Функция создания модели с Dropout
-# -------------------------------------------------------------------
-def create_model_with_dropout(dropout_rate):
-    model = models.Sequential([
-        layers.Conv2D(32, (3,3), padding='same', activation='relu', input_shape=(32,32,3)),
-        layers.BatchNormalization(),
-        layers.Conv2D(32, (3,3), padding='same', activation='relu'),
-        layers.BatchNormalization(),
-        layers.MaxPooling2D((2,2)),
-        layers.Dropout(dropout_rate),   # пространственный Dropout после пулинга
-
-        layers.Conv2D(64, (3,3), padding='same', activation='relu'),
-        layers.BatchNormalization(),
-        layers.Conv2D(64, (3,3), padding='same', activation='relu'),
-        layers.BatchNormalization(),
-        layers.MaxPooling2D((2,2)),
-        layers.Dropout(dropout_rate),
-
-        layers.Conv2D(128, (3,3), padding='same', activation='relu'),
-        layers.BatchNormalization(),
-        layers.Conv2D(128, (3,3), padding='same', activation='relu'),
-        layers.BatchNormalization(),
-        layers.MaxPooling2D((2,2)),
-        layers.Dropout(dropout_rate),
-
-        layers.GlobalAveragePooling2D(),
-        layers.Dense(10, activation='softmax')
-    ])
-    return model
+transform_test = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+])
 
 # -------------------------------------------------------------------
-# 3. Подбор параметра dropout
+# Загрузка данных
 # -------------------------------------------------------------------
-dropout_rates = [0.0, 0.2, 0.3, 0.5, 0.7]
-results = {}
+def get_dataloaders():
+    train_set = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
+    test_set = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
 
-print("\n=== Эксперименты с Dropout ===")
+    val_size = int(0.1 * len(train_set))
+    train_size = len(train_set) - val_size
+    train_subset, val_subset = random_split(train_set, [train_size, val_size])
 
-for dr in dropout_rates:
-    print(f"\n--- Обучение модели с dropout = {dr} ---")
-    model = create_model_with_dropout(dr)
-    model.compile(optimizer='adam',
-                  loss='categorical_crossentropy',
-                  metrics=['accuracy'])
+    batch_size = 64
+    train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+    return train_loader, val_loader, test_loader
 
-    early_stop = callbacks.EarlyStopping(monitor='val_accuracy', patience=10, restore_best_weights=True, verbose=0)
-    reduce_lr = callbacks.ReduceLROnPlateau(monitor='val_accuracy', factor=0.5, patience=5, verbose=0)
+# -------------------------------------------------------------------
+# Архитектура с параметром dropout
+# -------------------------------------------------------------------
+class DeepCNN(nn.Module):
+    def __init__(self, num_classes=10, dropout_rate=0.5):
+        super(DeepCNN, self).__init__()
+        self.features = nn.Sequential(
+            # Блок 1: 64
+            nn.Conv2d(3, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Dropout2d(dropout_rate),
+
+            # Блок 2: 128
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Dropout2d(dropout_rate),
+
+            # Блок 3: 256
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Dropout2d(dropout_rate),
+
+            # Блок 4: 512
+            nn.Conv2d(256, 512, kernel_size=3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Dropout2d(dropout_rate),
+        )
+        self.classifier = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Dropout(0.3),          # фиксированный dropout в классификаторе
+            nn.Linear(512, num_classes)
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.classifier(x)
+        return x
+
+# -------------------------------------------------------------------
+# Функции обучения и валидации
+# -------------------------------------------------------------------
+def train_epoch(model, loader, criterion, optimizer):
+    model.train()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+    for inputs, labels in loader:
+        inputs, labels = inputs.to(device), labels.to(device)
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * inputs.size(0)
+        _, predicted = torch.max(outputs, 1)
+        total += labels.size(0)
+        correct += (predicted == labels).sum().item()
+    return running_loss / len(loader.dataset), correct / total
+
+def evaluate(model, loader, criterion):
+    model.eval()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for inputs, labels in loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+
+            running_loss += loss.item() * inputs.size(0)
+            _, predicted = torch.max(outputs, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+    return running_loss / len(loader.dataset), correct / total
+
+# -------------------------------------------------------------------
+# Обучение для заданного dropout_rate (ускоренное)
+# -------------------------------------------------------------------
+def run_experiment(dropout_rate, train_loader, val_loader, test_loader):
+    print(f"\n=== Dropout = {dropout_rate} ===")
+    model = DeepCNN(dropout_rate=dropout_rate).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=5e-4)
+
+    # Косинусное затухание с прогревом (5 эпох)
+    def warmup_cosine_scheduler(optimizer, warmup_epochs, total_epochs):
+        def lr_lambda(epoch):
+            if epoch < warmup_epochs:
+                return (epoch + 1) / warmup_epochs
+            else:
+                progress = (epoch - warmup_epochs) / (total_epochs - warmup_epochs)
+                return 0.5 * (1 + np.cos(np.pi * progress))
+        return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    total_epochs = 50                # сокращённое количество эпох
+    scheduler = warmup_cosine_scheduler(optimizer, warmup_epochs=5, total_epochs=total_epochs)
+    criterion = nn.CrossEntropyLoss()
+
+    best_val_acc = 0.0
+    patience = 10                    # ранняя остановка после 10 эпох без улучшения
+    epochs_no_improve = 0
+    best_state = None
 
     start_time = time.time()
-    history = model.fit(
-        x_train, y_train,
-        batch_size=128,
-        epochs=50,
-        validation_data=(x_val, y_val),
-        callbacks=[early_stop, reduce_lr],
-        verbose=1   # показываем прогресс, чтобы видеть, что обучение идёт
-    )
+    for epoch in range(total_epochs):
+        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer)
+        val_loss, val_acc = evaluate(model, val_loader, criterion)
+        scheduler.step()
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            epochs_no_improve = 0
+            best_state = model.state_dict().copy()
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                print(f"  Early stopping на эпохе {epoch+1}")
+                break
+
+        if (epoch+1) % 10 == 0:
+            print(f"  Epoch {epoch+1}: train_acc={train_acc:.4f}, val_acc={val_acc:.4f}")
+
+    # Восстанавливаем лучшие веса и оцениваем на тесте
+    model.load_state_dict(best_state)
+    test_loss, test_acc = evaluate(model, test_loader, criterion)
     elapsed = time.time() - start_time
-
-    test_loss, test_acc = model.evaluate(x_test, y_test, verbose=0)
-    results[dr] = test_acc
-    print(f"Dropout {dr}: точность = {test_acc:.4f}, время = {elapsed/60:.1f} мин.")
+    print(f"Dropout {dropout_rate}: точность на тесте = {test_acc:.4f}, время = {elapsed/60:.1f} мин.")
+    return test_acc
 
 # -------------------------------------------------------------------
-# 4. Анализ результатов
+# Основная функция
 # -------------------------------------------------------------------
-print("\n=== Сравнение точности на тесте ===")
-for dr, acc in results.items():
-    print(f"Dropout {dr}: {acc:.4f}")
+def main():
+    train_loader, val_loader, test_loader = get_dataloaders()
 
-best_dr = max(results, key=results.get)
-best_acc = results[best_dr]
-print(f"\nЛучший параметр Dropout: {best_dr} с точностью {best_acc:.4f}")
+    # Сокращённый список значений dropout для ускорения
+    dropout_rates = [0.0, 0.3, 0.5]
+    results = {}
 
-# Сравнение с базовой моделью (dropout=0.0)
-base_acc = results[0.0]
-if best_dr != 0.0:
-    improvement = best_acc - base_acc
-    if improvement > 0:
-        print(f"Улучшение на {improvement:.4f} ({improvement*100:.2f}%) по сравнению с базовой моделью.")
+    for dr in dropout_rates:
+        acc = run_experiment(dr, train_loader, val_loader, test_loader)
+        results[dr] = acc
+
+    print("\n=== Сравнение ===")
+    for dr, acc in results.items():
+        print(f"Dropout {dr}: {acc:.4f}")
+
+    best_dr = max(results, key=results.get)
+    best_acc = results[best_dr]
+    print(f"\nЛучший параметр Dropout: {best_dr} с точностью {best_acc:.4f}")
+
+    base_acc = results[0.0]
+    if best_dr != 0.0:
+        diff = best_acc - base_acc
+        if diff > 0:
+            print(f"Улучшение на {diff:.4f} ({diff*100:.2f}%) по сравнению с базовой моделью.")
+        else:
+            print(f"Ухудшение на {abs(diff):.4f} ({abs(diff)*100:.2f}%).")
     else:
-        print(f"Ухудшение на {abs(improvement):.4f} ({abs(improvement)*100:.2f}%).")
-else:
-    print("Базовая модель (без dropout) показала наилучший результат.")
+        print("Базовая модель (без Dropout) показала наилучший результат.")
 
-print("\nВывод: Dropout помогает бороться с переобучением, но при слишком высоком коэффициенте")
-print("(например, 0.7) может ухудшить точность. Оптимальное значение для данной архитектуры –",
-      best_dr if best_dr != 0.0 else "0.0 (т.е. без dropout)")
-
-# Сохраняем лучшую модель
-best_model = create_model_with_dropout(best_dr)
-best_model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
-# Обучаем лучшую модель полную эпоху? Но она уже обучена в цикле. Можно просто сохранить.
-# Для простоты сохраним модель из последней итерации цикла, но лучше переобучить.
-# Здесь для демонстрации мы просто сохраним модель, обученную при лучшем параметре.
-# Однако в нашем цикле мы не сохраняли лучшие веса отдельно. Если нужно – можно добавить.
-# Пропустим сохранение, чтобы не усложнять.
-
-print("\nДополнительное задание выполнено.")
-
+if __name__ == '__main__':
+    multiprocessing.freeze_support()
+    main()
